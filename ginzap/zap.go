@@ -3,6 +3,9 @@
 package ginzap
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -39,6 +42,12 @@ type Config struct {
 	// skip is a Skipper that indicates which logs should not be written.
 	// Optional.
 	Skipper Skipper
+	// LogRequestBody indicates whether to log the request body.
+	// Optional. Default: false
+	LogRequestBody bool
+	// LogResponseBody indicates whether to log the response body.
+	// Optional. Default: false
+	LogResponseBody bool
 }
 
 // Ginzap returns a gin.HandlerFunc (middleware) that logs requests using uber-go/zap.
@@ -65,6 +74,31 @@ func GinzapWithConfig(logger ZapLogger, conf *Config) gin.HandlerFunc {
 		// some evil middlewares modify this values
 		path := c.Request.URL.Path
 		query := c.Request.URL.RawQuery
+
+		// Get request body if enabled
+		var requestBody string
+		if conf.LogRequestBody {
+			if c.Request.Body != nil {
+				body, err := c.GetRawData()
+				if err == nil {
+					// Only log if it's valid JSON
+					var js interface{}
+					if json.Unmarshal(body, &js) == nil {
+						requestBody = string(body)
+					}
+					// Restore the request body for other middleware
+					c.Request.Body = io.NopCloser(strings.NewReader(string(body)))
+				}
+			}
+		}
+
+		// Get response body if enabled
+		var blw *bodyLogWriter
+		if conf.LogResponseBody {
+			blw = &bodyLogWriter{body: bytes.NewBufferString(""), ResponseWriter: c.Writer}
+			c.Writer = blw
+		}
+
 		c.Next()
 		track := true
 
@@ -99,6 +133,20 @@ func GinzapWithConfig(logger ZapLogger, conf *Config) gin.HandlerFunc {
 				zap.String("user-agent", c.Request.UserAgent()),
 				zap.Duration("latency", latency),
 			}
+
+			// Add request and response body if enabled
+			if conf.LogRequestBody && requestBody != "" {
+				fields = append(fields, zap.String("request-body", requestBody))
+			}
+			if conf.LogResponseBody && blw != nil {
+				// Only log if it's valid JSON
+				responseBody := blw.body.String()
+				var js interface{}
+				if json.Unmarshal([]byte(responseBody), &js) == nil {
+					fields = append(fields, zap.String("response-body", responseBody))
+				}
+			}
+
 			if conf.TimeFormat != "" {
 				fields = append(fields, zap.String("time", end.Format(conf.TimeFormat)))
 			}
@@ -123,6 +171,17 @@ func GinzapWithConfig(logger ZapLogger, conf *Config) gin.HandlerFunc {
 			}
 		}
 	}
+}
+
+// bodyLogWriter is a custom ResponseWriter that captures the response body
+type bodyLogWriter struct {
+	gin.ResponseWriter
+	body *bytes.Buffer
+}
+
+func (w *bodyLogWriter) Write(b []byte) (int, error) {
+	w.body.Write(b)
+	return w.ResponseWriter.Write(b)
 }
 
 func defaultHandleRecovery(c *gin.Context, err interface{}) {
